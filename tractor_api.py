@@ -4,10 +4,6 @@ import agentpy as ap
 import numpy as np
 import heapq
 
-# ==============================================================
-#                 🚜   MODELO COMPLETO DE TRACTORES
-# ==============================================================
-
 class ObstacleTractor(ap.Agent):
     """Static or slowly moving obstacle tractor"""
 
