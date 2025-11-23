@@ -1,4 +1,5 @@
 Flask==2.2.5
 Flask-Cors==4.0.0
 agentpy==0.1.5
-numpy==1.26.4
+numpy==1.26.
+gunicorn==21.2.0
