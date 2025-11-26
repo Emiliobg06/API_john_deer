@@ -1,237 +1,315 @@
-from flask import Flask, jsonify
+# tractor_api_flask_qcomm.py
+from flask import Flask, jsonify, request
 from flask_cors import CORS
 import agentpy as ap
 import numpy as np
-import heapq
+import random
+from collections import defaultdict
 
-class ObstacleTractor(ap.Agent):
-    """Static or slowly moving obstacle tractor"""
+# -------------------------
+#  Q-Learning Multi-Agent
+# -------------------------
 
+class QAgent(ap.Agent):
+    """Tractor agent with local Q-table and simple communication (shared visited cells)."""
     def setup(self):
-        self.width = self.p.obstacle_width
-        self.length = self.p.obstacle_length
-        self.velocity = np.array([0.0, 0.0])
-
-        # 50% move slowly
-        if self.model.nprandom.random() < 0.5:
-            angle = self.model.nprandom.random() * 2 * np.pi
-            speed = self.p.obstacle_speed
-            self.velocity = np.array([np.cos(angle), np.sin(angle)]) * speed
-
-    def setup_pos(self, space):
-        self.space = space
-        self.pos = space.positions[self]
-
-    def update_position(self):
-        if np.linalg.norm(self.velocity) > 0:
-            new_pos = self.pos + self.velocity
-
-            # Bounce off boundaries
-            for i in range(2):
-                if new_pos[i] < 0 or new_pos[i] > self.space.shape[i]:
-                    self.velocity[i] *= -1
-                    new_pos[i] = np.clip(new_pos[i], 0, self.space.shape[i])
-
-            self.space.move_to(self, new_pos)
-
-
-class MainTractor(ap.Agent):
-    """Main tractor that navigates with A*"""
-
-    def setup(self):
+        self.size = self.p.size
         self.width = self.p.tractor_width
         self.length = self.p.tractor_length
-        self.path = []
-        self.path_index = 0
-        self.reached_target = False
-        self.total_distance = 0
-        self.replan_counter = 0
+
+        # Q-learning hyperparams (can be tuned)
+        self.alpha = self.p.q_alpha
+        self.gamma = self.p.q_gamma
+        self.epsilon = self.p.q_epsilon
+        self.epsilon_min = self.p.q_epsilon_min
+        self.epsilon_decay = self.p.q_epsilon_decay
+
+        # actions: 8 directions
+        self.actions = [(0,1),(1,0),(0,-1),(-1,0),(1,1),(1,-1),(-1,1),(-1,-1)]
+        # local Q-table: state (x,y) -> np.array(len(actions))
+        self.q = defaultdict(lambda: np.zeros(len(self.actions)))
+
+        self.reached = False
+        self.total_distance = 0.0
+        self.visited = defaultdict(int)   # counts per cell visited by this agent
 
     def setup_pos(self, space):
         self.space = space
-        self.pos = space.positions[self]
-        self.start = np.array(self.pos)
-        self.target = np.array([self.p.size - 5, self.p.size - 5])
+        self.pos = space.positions[self]  # float position
+        self.cell = (int(round(self.pos[0])), int(round(self.pos[1])))
+        self.target = (int(self.p.size - 2), int(self.p.size - 2))
 
-    def heuristic(self, a, b):
-        return abs(a[0] - b[0]) + abs(a[1] - b[1])
+    def state(self):
+        return (int(round(self.pos[0])), int(round(self.pos[1])))
 
-    def is_collision(self, pos):
-        for obstacle in self.model.obstacles:
-            obs_pos = obstacle.pos
-            dist = np.linalg.norm(pos - obs_pos)
-            if dist < (self.width + obstacle.width) / 2 + self.p.safety_margin:
-                return True
-        return False
+    def choose_action(self, s, occupied_cells):
+        if random.random() < self.epsilon:
+            random.shuffle(self.actions)
+            best = None
+            best_score = -99999
+            for i, a in enumerate(self.actions):
+                cand = (s[0] + a[0], s[1] + a[1])
+                if 0 <= cand[0] < self.size and 0 <= cand[1] < self.size:
+                    score = -self.p.shared_memory.get(cand, 0) * 10
+                    if cand not in occupied_cells:
+                        score += 20
+                    if score > best_score:
+                        best_score = score
+                        best = i
+            if best is not None:
+                return best
+            
+            return random.choice(range(len(self.actions)))
+        else:
+            qvals = self.q[s]
+            maxv = np.max(qvals)
+            best_actions = [i for i, q in enumerate(qvals) if q == maxv]
+            return random.choice(best_actions)
 
-    def get_neighbors(self, pos):
-        neighbors = []
-        dirs = [
-            (0, 1), (1, 0), (0, -1), (-1, 0),
-            (1, 1), (1, -1), (-1, 1), (-1, -1)
-        ]
+    def update_q(self, s, a_idx, r, s2):
+        old = self.q[s][a_idx]
+        max_next = np.max(self.q[s2]) if s2 in self.q else 0.0
+        self.q[s][a_idx] = old + self.alpha * (r + self.gamma * max_next - old)
 
-        for dx, dy in dirs:
-            new = (pos[0] + dx, pos[1] + dy)
-            if 0 <= new[0] < self.p.size and 0 <= new[1] < self.p.size:
-                new_arr = np.array([float(new[0]), float(new[1])])
-                if not self.is_collision(new_arr):
-                    neighbors.append(new)
+    def decay_epsilon(self):
+        if self.epsilon > self.epsilon_min:
+            self.epsilon *= self.epsilon_decay
+            if self.epsilon < self.epsilon_min:
+                self.epsilon = self.epsilon_min
 
-        return neighbors
-
-    def a_star_search(self, start, goal):
-        s = (int(start[0]), int(start[1]))
-        g = (int(goal[0]), int(goal[1]))
-
-        open_set = []
-        heapq.heappush(open_set, (0, s))
-
-        came_from = {}
-        g_cost = {s: 0}
-        f_cost = {s: self.heuristic(s, g)}
-
-        while open_set:
-            current = heapq.heappop(open_set)[1]
-
-            if self.heuristic(current, g) < 2:
-                path = []
-                while current in came_from:
-                    path.append(np.array([float(current[0]), float(current[1])]))
-                    current = came_from[current]
-                path.append(start)
-                return path[::-1]
-
-            for nb in self.get_neighbors(current):
-                tentative = g_cost[current] + 1
-
-                if nb not in g_cost or tentative < g_cost[nb]:
-                    came_from[nb] = current
-                    g_cost[nb] = tentative
-                    f_cost[nb] = tentative + self.heuristic(nb, g)
-                    heapq.heappush(open_set, (f_cost[nb], nb))
-
-        return []
-
-    def plan_path(self):
-        self.path = self.a_star_search(self.pos, self.target)
-        self.path_index = 0
-        self.replan_counter += 1
-
-    def update_position(self):
-        if self.reached_target:
-            return
-
-        if self.path_index < len(self.path):
-            next_pos = self.path[self.path_index]
-            if self.is_collision(next_pos):
-                self.plan_path()
-                return
-
-        if not self.path or self.path_index >= len(self.path):
-            if np.linalg.norm(self.pos - self.target) < 2:
-                self.reached_target = True
-                print("Reached target!")
-                return
-            self.plan_path()
-            return
-
-        next_pos = self.path[self.path_index]
-        dist = np.linalg.norm(next_pos - self.pos)
-        self.total_distance += dist
-
-        self.space.move_to(self, next_pos)
-        self.path_index += 1
-
-
-class TractorModel(ap.Model):
+class QTractorModel(ap.Model):
+    """Model with N agents; they communicate via shared visited_cells to avoid overlap."""
     def setup(self):
+        # space is continuous but we'll use discrete cells for Q learning
         self.space = ap.Space(self, shape=[self.p.size, self.p.size])
+        self.agents = ap.AgentList(self, self.p.n_agents, QAgent)
+        # initialize agents evenly spaced near bottom
+        start_positions = []
+        for i in range(self.p.n_agents):
+            x = (i + 0.5) * (self.p.size / self.p.n_agents)
+            y = 1.0
+            start_positions.append(np.array([float(x), float(y)]))
+        self.space.add_agents(self.agents, positions=start_positions)
+        self.agents.setup_pos(self.space)
 
-        # Obstacles
-        self.obstacles = ap.AgentList(self, self.p.n_obstacles, ObstacleTractor)
-        self.space.add_agents(self.obstacles, random=True)
-        self.obstacles.setup_pos(self.space)
+        self.shared_visited = defaultdict(int)
 
-        # Tractor
-        self.tractor = MainTractor(self)
-        self.space.add_agents([self.tractor], positions=[np.array([5.0, 5.0])])
-        self.tractor.setup_pos(self.space)
-
-        # Initial A*
-        self.tractor.plan_path()
+        self.shared_memory = defaultdict(int)
+        self.p.shared_memory = self.shared_memory  # para acceso dentro del agente
+   # (x,y) -> count (all agents)
+        # register initial visits
+        for a in self.agents:
+            c = a.state()
+            self.shared_visited[c] += 1
+            a.visited[c] += 1
 
     def step(self):
-        self.obstacles.update_position()
-        self.tractor.update_position()
+        """One simulation step: each agent chooses action, then resolve moves to avoid collision/overlap."""
+        # Build current occupied cells by agents (their current cells)
+        occupied_now = {a.state(): a for a in self.agents}
+
+        # Each agent selects an intended action based on shared visited map
+        intents = {}  # agent -> (next_cell, action_idx)
+        occupied_cells = set(self.shared_visited.keys())  # cells recently visited by any agent (discourage overlap)
+        for a in self.agents:
+            if a.reached:
+                intents[a] = (a.state(), None)
+                continue
+
+            s = a.state()
+            action_idx = a.choose_action(s, occupied_cells)
+            dx, dy = a.actions[action_idx]
+            cand = (s[0] + dx, s[1] + dy)
+            # clip to bounds
+            cand = (max(0, min(self.p.size - 1, cand[0])), max(0, min(self.p.size - 1, cand[1])))
+            intents[a] = (cand, action_idx)
+
+        # Resolve conflicts: if multiple agents intend same cell => none moves (they wait) and get penalty for collision attempt
+        # Also avoid moving into currently occupied cell by another agent (simultaneous swap prevented).
+        target_counts = defaultdict(list)
+        for a, (cand, ai) in intents.items():
+            target_counts[cand].append(a)
+
+        # Prepare rewards and apply moves
+        rewards = {}
+        for a in self.agents:
+            s = a.state()
+            cand, aidx = intents[a]
+            # default reward
+            r = -1.0  # small step penalty to encourage coverage efficiency
+
+            if a.reached:
+                # already at goal
+                rewards[a] = 0.0
+                continue
+
+            # collision if candidate is occupied now by another agent (no simultaneous swap allowed)
+            occupied_now_by_other = (cand in occupied_now) and (occupied_now[cand] is not a)
+            multi_intent = len(target_counts[cand]) > 1
+
+            if occupied_now_by_other or multi_intent:
+                # collision/overlap attempt — penalize and do not move
+                r += -50.0
+                # update Q with next state = same state
+                a_next_state = s
+                a.update_q(s, aidx, r, a_next_state)
+                rewards[a] = r
+                # do NOT move
+                continue
+
+            shared_v = self.shared_visited.get(cand, 0)
+            heat = self.shared_memory.get(cand, 0)
+            r -= shared_v * 8.0
+            r -= heat * 4.0
+            if shared_v == 0:
+                r += 20.0
+            for other in self.agents:
+                if other is not a:
+                    ox, oy = other.state()
+                    if abs(ox - cand[0]) + abs(oy - cand[1]) <= 2:
+                        r -= 15.0
 
 
-# ==============================================================
-#                       🌐  API FLASK
-# ==============================================================
+            # goal check
+            if cand == a.target:
+                r += 200.0  # big reward for reaching goal
 
+            # apply move: update position
+            new_pos = np.array([float(cand[0]), float(cand[1])])
+            dist = np.linalg.norm(new_pos - a.pos)
+            a.total_distance += dist
+            # physically move in the space
+            self.space.move_to(a, new_pos)
+            a.visited[cand] += 1
+            self.shared_visited[cand] += 1
+            self.shared_memory[cand] += 1
+
+            # Q update: s -> cand
+            a.update_q(s, aidx, r, cand)
+            rewards[a] = r
+
+            # reached?
+            if cand == a.target:
+                a.reached = True
+
+            # decay epsilon
+            a.decay_epsilon()
+
+        # return rewards optionally (not used)
+        for a in self.agents:
+            if hasattr(a, "last_cell") and a.last_cell == a.state():
+                rewards[a] -= 5.0
+            a.last_cell = a.state()
+            
+        return rewards
+
+    def reset(self):
+        # reset positions and q-table if desired (we keep q-table to allow learning across runs unless user resets)
+        start_positions = []
+        for i in range(self.p.n_agents):
+            x = (i + 0.5) * (self.p.size / self.p.n_agents)
+            y = 1.0
+            start_positions.append(np.array([float(x), float(y)]))
+        # reset agent positions and flags
+        for i, a in enumerate(self.agents):
+            self.space.move_to(a, start_positions[i])
+            a.reached = False
+            a.total_distance = 0.0
+            a.visited = defaultdict(int)
+            # optionally reset epsilon to initial
+            a.epsilon = self.p.q_epsilon
+
+        # clear shared_visited and re-register
+        self.shared_visited.clear()
+        for a in self.agents:
+            self.shared_visited[a.state()] += 1
+            a.visited[a.state()] += 1
+
+# -------------------------
+# Flask API
+# -------------------------
 app = Flask(__name__)
 CORS(app)
 
-# Parameters
+# parameters
 parameters = {
-    'size': 50,
-    'seed': 123,
-    'steps': 60,
-    'n_obstacles': 15,
-    'tractor_width': 2,
-    'tractor_length': 2,
-    'obstacle_width': 2.5,
-    'obstacle_length': 2.5,
-    'obstacle_speed': 0.05,
-    'safety_margin': 1.5
+    'size': 40,           # grid size (cells)
+    'n_agents': 5,
+    'tractor_width': 1,
+    'tractor_length': 1,
+    # Q hyperparams
+    'q_alpha': 0.6,
+    'q_gamma': 0.95,
+    'q_epsilon': 0.8,
+    'q_epsilon_min': 0.05,
+    'q_epsilon_decay': 0.995
 }
 
-# Init model
-model = TractorModel(parameters)
-model.run(steps=1)
+# instantiate model
+model = QTractorModel(parameters)
+model.run(steps=1)  # initial setup
 
+# helper to serialize some Q entries (sample)
+def serialize_q(agent, max_entries=200):
+    out = []
+    for i, (s, vals) in enumerate(agent.q.items()):
+        if i >= max_entries:
+            break
+        out.append({'state': s, 'q': vals.tolist()})
+    return out
 
 @app.route("/state")
-def get_state():
-    t = model.tractor
-
+def state():
+    agents_data = []
+    for idx, a in enumerate(model.agents):
+        agents_data.append({
+            'id': idx,
+            'x': float(a.pos[0]),
+            'y': float(a.pos[1]),
+            'cell': a.state(),
+            'reached': bool(a.reached),
+            'epsilon': float(a.epsilon),
+            'total_distance': float(a.total_distance)
+        })
     data = {
-        "tractor": {
-            "x": float(t.pos[0]),
-            "y": float(t.pos[1]),
-            "width": float(t.width),
-            "length": float(t.length),
-        },
-        "obstacles": [
-            {
-                "x": float(o.pos[0]),
-                "y": float(o.pos[1]),
-                "width": float(o.width),
-                "length": float(o.length)
-            }
-            for o in model.obstacles
-        ],
-        "path": [[float(p[0]), float(p[1])] for p in t.path],
-        "map_size": model.p.size
+        'map_size': model.p.size,
+        'agents': agents_data,
+        'shared_visited': [{'cell': list(k), 'count': v} for k,v in model.shared_visited.items()]
     }
-
     return jsonify(data)
 
+@app.route("/agents")
+def agents_info():
+    res = []
+    for i, a in enumerate(model.agents):
+        res.append({
+            'id': i,
+            'cell': a.state(),
+            'visited_counts': [{'cell': list(k), 'count': v} for k,v in a.visited.items()],
+            'epsilon': float(a.epsilon)
+        })
+    return jsonify({'agents': res})
 
-@app.route("/step", methods=["POST"])
+@app.route("/qtable")
+def qtable():
+    # returns small sample of each agent's Q-table
+    out = {}
+    for i, a in enumerate(model.agents):
+        out[f'agent_{i}'] = serialize_q(a, max_entries=200)
+    return jsonify({'qtables': out})
+
+@app.route("/step", methods=['POST', 'GET'])
 def step():
-    model.step()
-    return jsonify({"message": f"Simulation advanced to t={model.t}"})
+    # run one sim step
+    rewards = model.step()
+    # option: return rewards per agent (converted)
+    rewards_out = {str(i): float(rewards.get(a, 0.0)) for i, a in enumerate(model.agents)}
+    return jsonify({'message': f'step {model.t} executed', 'rewards': rewards_out})
 
-
-@app.route("/reset", methods=["POST"])
+@app.route("/reset", methods=['POST', 'GET'])
 def reset():
-    global model
-    model = TractorModel(parameters)
-    model.run(steps=1)
-    return jsonify({"message": "Simulation reset."})
-
+    model.reset()
+    return jsonify({'message': 'model reset'})
 
 if __name__ == "__main__":
     app.run(debug=True)
