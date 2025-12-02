@@ -6,32 +6,27 @@ import numpy as np
 import random
 from collections import defaultdict
 
-# -------------------------
-#  Q-Learning Multi-Agent
-# -------------------------
 
 class QAgent(ap.Agent):
-    """Tractor agent with local Q-table and simple communication (shared visited cells)."""
+
     def setup(self):
         self.size = self.p.size
         self.width = self.p.tractor_width
         self.length = self.p.tractor_length
 
-        # Q-learning hyperparams (can be tuned)
         self.alpha = self.p.q_alpha
         self.gamma = self.p.q_gamma
         self.epsilon = self.p.q_epsilon
         self.epsilon_min = self.p.q_epsilon_min
         self.epsilon_decay = self.p.q_epsilon_decay
 
-        # actions: 8 directions
         self.actions = [(0,1),(1,0),(0,-1),(-1,0),(1,1),(1,-1),(-1,1),(-1,-1)]
-        # local Q-table: state (x,y) -> np.array(len(actions))
+
         self.q = defaultdict(lambda: np.zeros(len(self.actions)))
 
         self.reached = False
         self.total_distance = 0.0
-        self.visited = defaultdict(int)   # counts per cell visited by this agent
+        self.visited = defaultdict(int)
 
     def setup_pos(self, space):
         self.space = space
@@ -78,17 +73,25 @@ class QAgent(ap.Agent):
                 self.epsilon = self.epsilon_min
 
 class QTractorModel(ap.Model):
-    """Model with N agents; they communicate via shared visited_cells to avoid overlap."""
+
     def setup(self):
-        # space is continuous but we'll use discrete cells for Q learning
+
         self.space = ap.Space(self, shape=[self.p.size, self.p.size])
         self.agents = ap.AgentList(self, self.p.n_agents, QAgent)
-        # initialize agents evenly spaced near bottom
+
+#        start_positions = []
+#        for i in range(self.p.n_agents):
+#            x = (i + 0.5) * (self.p.size / self.p.n_agents)
+#            y = 1.0
+#            start_positions.append(np.array([float(x), float(y)]))
         start_positions = []
+        cols = self.p.n_agents
+        spacing_x = self.p.size / cols
         for i in range(self.p.n_agents):
-            x = (i + 0.5) * (self.p.size / self.p.n_agents)
-            y = 1.0
+            x = (i + 0.5) * spacing_x
+            y = random.uniform(0, 3)   # pequeña variación pero no aleatoria completa
             start_positions.append(np.array([float(x), float(y)]))
+
         self.space.add_agents(self.agents, positions=start_positions)
         self.agents.setup_pos(self.space)
 
@@ -149,7 +152,7 @@ class QTractorModel(ap.Model):
 
             if occupied_now_by_other or multi_intent:
                 # collision/overlap attempt — penalize and do not move
-                r += -50.0
+                r += -100.0 #-50.0
                 # update Q with next state = same state
                 a_next_state = s
                 a.update_q(s, aidx, r, a_next_state)
@@ -159,10 +162,10 @@ class QTractorModel(ap.Model):
 
             shared_v = self.shared_visited.get(cand, 0)
             heat = self.shared_memory.get(cand, 0)
-            r -= shared_v * 8.0
-            r -= heat * 4.0
+            r -= shared_v * 12.0
+            r -= heat * 8.0
             if shared_v == 0:
-                r += 20.0
+                r += 40.0
             for other in self.agents:
                 if other is not a:
                     ox, oy = other.state()
@@ -234,15 +237,15 @@ CORS(app)
 # parameters
 parameters = {
     'size': 40,           # grid size (cells)
-    'n_agents': 5,
+    'n_agents': 6,
     'tractor_width': 1,
     'tractor_length': 1,
     # Q hyperparams
-    'q_alpha': 0.6,
-    'q_gamma': 0.95,
-    'q_epsilon': 0.8,
-    'q_epsilon_min': 0.05,
-    'q_epsilon_decay': 0.995
+    'q_alpha': 0.5, #0.6
+    'q_gamma': 0.98, #0.95
+    'q_epsilon': 1.0, #0.8
+    'q_epsilon_min': 0.01, #0.05
+    'q_epsilon_decay': 0.997 #0.995
 }
 
 # instantiate model
