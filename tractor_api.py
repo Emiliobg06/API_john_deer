@@ -349,13 +349,15 @@ def report():
     size = model.p.size
     total_cells = size * size
 
-    # Coverage: cuántas celdas fueron visitadas al menos una vez
+    # Coverage global
     visited_cells = len(model.shared_visited)
+    coverage_percentage = (visited_cells / total_cells) * 100
 
-    # Overlap: celdas con más de 1 visita
+    # Overlap global (redundancia total)
     overlapped_cells = sum(1 for c in model.shared_visited.values() if c > 1)
+    overlap_percentage = (overlapped_cells / visited_cells) * 100 if visited_cells > 0 else 0
 
-    # Distancias por agente
+    # Distancias
     distances = [float(a.total_distance) for a in model.agents]
     total_distance = sum(distances)
     avg_distance = total_distance / len(distances)
@@ -363,28 +365,52 @@ def report():
     # Epsilons
     epsilons = [float(a.epsilon) for a in model.agents]
 
+    # Métricas por agente
+    agents_report = []
+    for i, a in enumerate(model.agents):
+
+        # Redundancia por agente: cuántas celdas visitó +1 vez
+        repeated = sum(1 for v in a.visited.values() if v > 1)
+
+        # Detección simple de ciclos: si más del 20% de sus celdas tienen >2 visitas
+        cycles = sum(1 for v in a.visited.values() if v >= 3)
+        cycle_detected = cycles > max(5, 0.2 * len(a.visited))
+
+        agents_report.append({
+            "id": i,
+            "epsilon": float(a.epsilon),
+            "distance": float(a.total_distance),
+            "unique_cells_visited": len(a.visited),
+
+            # Redundancia / sobrelapado por agente
+            "redundant_cells": repeated,
+            "redundancy_percentage": (repeated / len(a.visited)) * 100 if len(a.visited) > 0 else 0,
+
+            # Ciclos / colisiones indirectas
+            "cycle_detected": cycle_detected,
+            "cells_with_3+_visits": cycles,
+        })
+
+    # Resumen global
     report_data = {
-        "coverage_percentage": (visited_cells / total_cells) * 100,
+        # Cobertura total
+        "coverage_percentage": coverage_percentage,
         "visited_cells": visited_cells,
         "total_cells": total_cells,
 
+        # Sobrelapado global
         "overlap_cells": overlapped_cells,
-        "overlap_percentage": (overlapped_cells / visited_cells) * 100 if visited_cells > 0 else 0,
+        "overlap_percentage": overlap_percentage,
 
+        # Distancias (eficiencia energética)
         "total_distance_all_agents": total_distance,
         "average_distance_per_agent": avg_distance,
 
+        # Exploración
         "epsilon_values": epsilons,
 
-        "agents": [
-            {
-                "id": i,
-                "epsilon": float(a.epsilon),
-                "distance": float(a.total_distance),
-                "unique_cells_visited": len(a.visited)
-            }
-            for i, a in enumerate(model.agents)
-        ]
+        # Informe detallado por agente
+        "agents": agents_report
     }
 
     return jsonify(report_data)
