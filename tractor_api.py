@@ -314,5 +314,50 @@ def reset():
     model.reset()
     return jsonify({'message': 'model reset'})
 
+@app.route("/report")
+def report():
+    size = model.p.size
+    total_cells = size * size
+
+    # Coverage: cuántas celdas fueron visitadas al menos una vez
+    visited_cells = len(model.shared_visited)
+
+    # Overlap: celdas con más de 1 visita
+    overlapped_cells = sum(1 for c in model.shared_visited.values() if c > 1)
+
+    # Distancias por agente
+    distances = [float(a.total_distance) for a in model.agents]
+    total_distance = sum(distances)
+    avg_distance = total_distance / len(distances)
+
+    # Epsilons
+    epsilons = [float(a.epsilon) for a in model.agents]
+
+    report_data = {
+        "coverage_percentage": (visited_cells / total_cells) * 100,
+        "visited_cells": visited_cells,
+        "total_cells": total_cells,
+
+        "overlap_cells": overlapped_cells,
+        "overlap_percentage": (overlapped_cells / visited_cells) * 100 if visited_cells > 0 else 0,
+
+        "total_distance_all_agents": total_distance,
+        "average_distance_per_agent": avg_distance,
+
+        "epsilon_values": epsilons,
+
+        "agents": [
+            {
+                "id": i,
+                "epsilon": float(a.epsilon),
+                "distance": float(a.total_distance),
+                "unique_cells_visited": len(a.visited)
+            }
+            for i, a in enumerate(model.agents)
+        ]
+    }
+
+    return jsonify(report_data)
+
 if __name__ == "__main__":
     app.run(debug=True)
