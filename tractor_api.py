@@ -45,7 +45,7 @@ class QAgent(ap.Agent):
             for i, a in enumerate(self.actions):
                 cand = (s[0] + a[0], s[1] + a[1])
                 if 0 <= cand[0] < self.size and 0 <= cand[1] < self.size:
-                    score = -self.p.shared_memory.get(cand, 0) * 10
+                    score = -self.p.shared_memory.get(cand, 0) * 30  # increased weight to avoid overlap
                     if cand not in occupied_cells:
                         score += 20
                     if score > best_score:
@@ -56,7 +56,14 @@ class QAgent(ap.Agent):
             
             return random.choice(range(len(self.actions)))
         else:
-            qvals = self.q[s]
+            # En explotación, también considerar shared_memory para evitar overlap
+            qvals = self.q[s].copy()
+            # Penalizar acciones que llevan a celdas con alta memoria
+            for i, a in enumerate(self.actions):
+                cand = (s[0] + a[0], s[1] + a[1])
+                if 0 <= cand[0] < self.size and 0 <= cand[1] < self.size:
+                    memory_penalty = self.p.shared_memory.get(cand, 0) * 30
+                    qvals[i] -= memory_penalty
             maxv = np.max(qvals)
             best_actions = [i for i, q in enumerate(qvals) if q == maxv]
             return random.choice(best_actions)
@@ -152,7 +159,7 @@ class QTractorModel(ap.Model):
 
             if occupied_now_by_other or multi_intent:
                 # collision/overlap attempt — penalize and do not move
-                r += -100.0 #-50.0
+                r += -150.0  # increased penalty to discourage collisions
                 # update Q with next state = same state
                 a_next_state = s
                 a.update_q(s, aidx, r, a_next_state)
@@ -162,15 +169,23 @@ class QTractorModel(ap.Model):
 
             shared_v = self.shared_visited.get(cand, 0)
             heat = self.shared_memory.get(cand, 0)
-            r -= shared_v * 12.0
-            r -= heat * 8.0
+            # Penalización exponencial: más visitas = penalización mucho mayor
+            r -= shared_v * 25.0  # base penalty
+            r -= (shared_v ** 1.5) * 10.0  # penalty adicional exponencial para múltiples visitas
+            r -= heat * 20.0  # increased heat penalty
             if shared_v == 0:
-                r += 40.0
+                r += 60.0  # increased reward for unvisited cells
+            
+            # Penalización acumulativa por proximidad (más agresiva)
+            proximity_penalty = 0
             for other in self.agents:
                 if other is not a:
                     ox, oy = other.state()
-                    if abs(ox - cand[0]) + abs(oy - cand[1]) <= 2:
-                        r -= 15.0
+                    dist = abs(ox - cand[0]) + abs(oy - cand[1])
+                    if dist <= 4:  # aumentar distancia de detección
+                        # Penalización inversamente proporcional a la distancia
+                        proximity_penalty += 30.0 / (dist + 1)
+            r -= proximity_penalty
 
 
             # goal check
@@ -186,6 +201,10 @@ class QTractorModel(ap.Model):
             a.visited[cand] += 1
             self.shared_visited[cand] += 1
             self.shared_memory[cand] += 1
+            
+            # Penalización adicional si la celda fue visitada recientemente por otros agentes
+            if shared_v > 1:  # si fue visitada más de una vez
+                r -= (shared_v - 1) * 30.0  # penalización extra por cada visita adicional
 
             # Q update: s -> cand
             a.update_q(s, aidx, r, cand)
@@ -195,14 +214,25 @@ class QTractorModel(ap.Model):
             if cand == a.target:
                 a.reached = True
 
-            # decay epsilon
-            a.decay_epsilon()
-
         # return rewards optionally (not used)
         for a in self.agents:
             if hasattr(a, "last_cell") and a.last_cell == a.state():
-                rewards[a] -= 5.0
+                rewards[a] -= 15.0  # increased penalty for staying in same cell
             a.last_cell = a.state()
+        
+        # Decay epsilon for ALL agents in every step (even if they didn't move or reached goal)
+        # This ensures consistent epsilon decay across all agents
+        for a in self.agents:
+            a.decay_epsilon()
+        
+        # Decay shared_memory to prevent infinite accumulation and reduce overlap over time
+        # More aggressive decay: 0.995 means faster decay (0.5% per step)
+        # After 500 steps: 0.995^500 ≈ 0.082 (92% reduction)
+        decay_factor = 0.995  # more aggressive decay
+        for cell in list(self.shared_memory.keys()):
+            self.shared_memory[cell] *= decay_factor
+            if self.shared_memory[cell] < 0.1:
+                del self.shared_memory[cell]
             
         return rewards
 
